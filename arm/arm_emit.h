@@ -78,9 +78,9 @@ void execute_swi_thumb(u32 pc);
 #define STORE_TBL_OFF     0x118
 #define SPSR_RAM_OFF      0x100
 
+/* Single expression, so it's safe to use in unbraced if/else/for bodies */
 #define write32(value)                                                        \
-  *((u32 *)translation_ptr) = value;                                          \
-  translation_ptr += 4                                                        \
+  (*((u32 *)translation_ptr) = (value), translation_ptr += 4)                 \
   
 #define arm_relative_offset(source, offset)                                   \
   (((((u32)offset - (u32)source) - 8) >> 2) & 0xFFFFFF)                       \
@@ -450,12 +450,19 @@ u32 arm_disect_imm_32bit(u32 imm, u32 *stores, u32 *rotations)
   write32(new_pc);                                                            \
   generate_branch_filler(ARMCOND_AL, writeback_location)                      \
 
+/* Checks the cycle counter (negative means there are cycles left) using a
+   regular conditional branch, which the CPU can predict, unlike a computed
+   jump. Guest flags live in the host CPSR, so they are saved in reg_a2
+   (preserved by the update handler, which only returns here if the PC did
+   not change, so flags are still valid) and restored on both paths. */
 #define generate_branch_update(writeback_location, new_pc, mode)              \
-  ARM_MOV_REG_IMMSHIFT(0, reg_a0, reg_cycles, ARMSHIFT_LSR, 31);              \
-  /* If counter is negative, skip the update call (2 insts) */                \
-  ARM_ADD_REG_IMMSHIFT(0, ARMREG_PC, ARMREG_PC, reg_a0, ARMSHIFT_LSL, 3);     \
+  ARM_MRS_CPSR(0, reg_a2);                                                    \
+  ARM_CMP_REG_IMM(0, reg_cycles, 0, 0);                                       \
+  ARM_B_COND(0, ARMCOND_MI, 3);            /* cycles left: skip update */     \
+  ARM_B(0, 0);                             /* skip over the PC word */        \
   write32(new_pc);                                                            \
   generate_function_far_call(armfn_gbaup_##mode);   /* 2 instructions */      \
+  ARM_MSR_REG(0, ARM_PSR_F, reg_a2, ARM_CPSR);                                \
   generate_branch_filler(ARMCOND_AL, writeback_location)                      \
 
 
@@ -1348,19 +1355,35 @@ static void trace_instruction(u32 pc, u32 mode)
     ARM_ORR_REG_IMMSHIFT(0, reg_a2, reg_a2, ARMREG_LR, ARMSHIFT_ASR, 31);
 #endif
 
+/* Memory handlers return with "bx lr" (predictable) to the "b" that follows
+   the call, which skips over the u32 PC word that the slow paths read. */
+#define generate_skip_pc_word()                                               \
+  ARM_B(0, 0)                                                                 \
+
 #define generate_load_call_byte(tblnum)                                       \
   mem_calc_region(0);                                                         \
   generate_add_imm(reg_a2, (STORE_TBL_OFF + 68*tblnum + 4) >> 2, 0);          \
   ARM_LDR_REG_REG_SHIFT(0, reg_a2, reg_base, reg_a2, 0, 2);                   \
   ARM_BLX(0, reg_a2);                                                         \
+  generate_skip_pc_word()                                                     \
 
 #define generate_load_call_mbyte(tblnum, abits)                               \
   mem_calc_region(abits);                                                     \
   generate_add_imm(reg_a2, (STORE_TBL_OFF + 68*tblnum + 4) >> 2, 0);          \
   ARM_LDR_REG_REG_SHIFT(0, reg_a2, reg_base, reg_a2, 0, 2);                   \
   ARM_BLX(0, reg_a2);                                                         \
+  generate_skip_pc_word()                                                     \
 
+/* Store calls followed by a PC word */
 #define generate_store_call(tblnum)                                           \
+  mem_calc_region(0);                                                         \
+  generate_add_imm(reg_a2, (STORE_TBL_OFF + 68*tblnum + 4) >> 2, 0);          \
+  ARM_LDR_REG_REG_SHIFT(0, reg_a2, reg_base, reg_a2, 0, 2);                   \
+  ARM_BLX(0, reg_a2);                                                         \
+  generate_skip_pc_word()                                                     \
+
+/* "Safe" stores (used in STM sequences) have no PC word after the call */
+#define generate_store_call_nopc(tblnum)                                      \
   mem_calc_region(0);                                                         \
   generate_add_imm(reg_a2, (STORE_TBL_OFF + 68*tblnum + 4) >> 2, 0);          \
   ARM_LDR_REG_REG_SHIFT(0, reg_a2, reg_base, reg_a2, 0, 2);                   \
@@ -1370,7 +1393,7 @@ static void trace_instruction(u32 pc, u32 mode)
 #define generate_store_call_u8()        generate_store_call(0)
 #define generate_store_call_u16()       generate_store_call(1)
 #define generate_store_call_u32()       generate_store_call(2)
-#define generate_store_call_u32_safe()  generate_store_call(3)
+#define generate_store_call_u32_safe()  generate_store_call_nopc(3)
 #define generate_load_call_u8()         generate_load_call_byte(4)
 #define generate_load_call_s8()         generate_load_call_byte(5)
 #define generate_load_call_u16()        generate_load_call_mbyte(6, 1)
@@ -1378,17 +1401,39 @@ static void trace_instruction(u32 pc, u32 mode)
 #define generate_load_call_u32()        generate_load_call_mbyte(8, 2)
 
 
+/* ARM mode has no flag liveness information, flags are always preserved.
+   The inline RAM fast path is only used for ARM code running from RAM (where
+   games keep their hot ARM routines, ie. sound mixers) and for stack
+   accesses: ARM code in ROM tends to poll I/O, where it's just overhead. */
+#define arm_mem_fast_wanted()  (ram_region || rn == REG_SP)
+
 #define arm_access_memory_load(mem_type)                                      \
   cycle_count += 2;                                                           \
-  generate_load_call_##mem_type();                                            \
-  write32(pc);                                                                \
+  if (arm_mem_fast_wanted())                                                  \
+  {                                                                           \
+    emit_mem_access(&translation_ptr, memfast_kind_##mem_type, false, true,   \
+                    pc);                                                      \
+  }                                                                           \
+  else                                                                        \
+  {                                                                           \
+    generate_load_call_##mem_type();                                          \
+    write32(pc);                                                              \
+  }                                                                           \
   arm_generate_store_reg_pc_no_flags(reg_rv, rd)                              \
 
 #define arm_access_memory_store(mem_type)                                     \
   cycle_count++;                                                              \
   arm_generate_load_reg_pc(reg_a1, rd, 12);                                   \
-  generate_store_call_##mem_type();                                           \
-  write32((pc + 4))                                                           \
+  if (arm_mem_fast_wanted())                                                  \
+  {                                                                           \
+    emit_mem_access(&translation_ptr, memfast_kind_##mem_type, true, true,    \
+                    (pc + 4));                                                \
+  }                                                                           \
+  else                                                                        \
+  {                                                                           \
+    generate_store_call_##mem_type();                                         \
+    write32((pc + 4));                                                        \
+  }                                                                           \
 
 /* Calculate the address into a0 from _rn, _rm */
 
@@ -1546,17 +1591,50 @@ static void trace_instruction(u32 pc, u32 mode)
 
 #define arm_block_memory_writeback_pre_store(writeback_type)
 
+#define arm_block_fast_ok_load(s_bit)   (!arm_block_sbit_##s_bit)
+#define arm_block_fast_ok_store(s_bit)  (!arm_block_sbit_##s_bit && !(reg_list & 0x8000))
+#define arm_block_sbit_yes 1
+#define arm_block_sbit_no  0
+#define arm_block_is_store_store 1
+#define arm_block_is_store_load  0
+
+/* Stores do the writeback after all the stores (see the slow path) */
+#define arm_block_fast_post_store(writeback_type)                             \
+  arm_block_memory_writeback_post_store(writeback_type)                       \
+
+#define arm_block_fast_post_load(writeback_type)                              \
+
 #define arm_block_memory(access_type, offset_type, writeback_type, s_bit)     \
 {                                                                             \
   arm_decode_block_trans();                                                   \
   u32 offset = 0;                                                             \
   u32 i;                                                                      \
+  u8 *fast_fails[4];                                                          \
+  u32 fast_nfails = 0;                                                        \
+  u8 *fast_done = NULL;                                                       \
+  u8 fast_regs[16];                                                           \
+  u32 fast_n = 0;                                                             \
                                                                               \
   arm_generate_load_reg(reg_s0, rn);                                          \
   arm_block_memory_offset_##offset_type();                                    \
   arm_block_memory_writeback_pre_##access_type(writeback_type);               \
   ARM_BIC_REG_IMM(0, reg_s0, reg_s0, 0x03, 0);                                \
   arm_generate_store_reg(reg_s0, REG_SAVE);                                   \
+                                                                              \
+  for(i = 0; i < 16; i++)                                                     \
+    if((reg_list >> i) & 0x01)                                                \
+      fast_regs[fast_n++] = i;                                                \
+                                                                              \
+  if(fast_n && arm_block_fast_ok_##access_type(s_bit))                        \
+  {                                                                           \
+    fast_nfails = emit_blkmem_fast(&translation_ptr,                          \
+      arm_block_is_store_##access_type, arm_register_allocation,              \
+      fast_regs, fast_n, true, fast_fails);                                   \
+    arm_block_fast_post_##access_type(writeback_type);                        \
+    fast_done = translation_ptr;                                              \
+    ARM_B(0, 0);                                                              \
+    blkmem_fast_slow_entry(fast_fails, fast_nfails, true);                    \
+  }                                                                           \
                                                                               \
   for(i = 0; i < 16; i++)                                                     \
   {                                                                           \
@@ -1578,6 +1656,9 @@ static void trace_instruction(u32 pc, u32 mode)
     }                                                                         \
   }                                                                           \
                                                                               \
+  /* Both paths join here (with the loaded PC in reg_a0 if any) */            \
+  if(fast_done)                                                               \
+    generate_branch_patch_unconditional(fast_done, translation_ptr);          \
   arm_block_memory_adjust_pc_##access_type();                                 \
 }                                                                             \
 
@@ -1754,16 +1835,20 @@ static void trace_instruction(u32 pc, u32 mode)
   thumb_complete_store_reg(rgdst, reg_rd)
 
 #define thumb_access_memory_load(mem_type, _rd)                               \
+{                                                                             \
   cycle_count += 2;                                                           \
-  generate_load_call_##mem_type();                                            \
-  write32(pc);                                                                \
-  thumb_generate_store_reg(reg_rv, _rd)                                       \
+  emit_mem_access(&translation_ptr, memfast_kind_##mem_type, false,           \
+                  thumb_flags_live_after() != 0, pc);                         \
+  thumb_generate_store_reg(reg_rv, _rd);                                      \
+}                                                                             \
 
 #define thumb_access_memory_store(mem_type, _rd)                              \
+{                                                                             \
   cycle_count++;                                                              \
   thumb_generate_load_reg(reg_a1, _rd);                                       \
-  generate_store_call_##mem_type();                                           \
-  write32((pc + 2))                                                           \
+  emit_mem_access(&translation_ptr, memfast_kind_##mem_type, true,            \
+                  thumb_flags_live_after() != 0, (pc + 2));                   \
+}                                                                             \
 
 #define thumb_access_memory_generate_address_pc_relative(offset, _rb, _ro)    \
   generate_load_pc(reg_a0, (offset))                                          \
@@ -1790,6 +1875,341 @@ static void trace_instruction(u32 pc, u32 mode)
 }                                                                             \
 
 /* TODO: Make these use cached registers. Implement iwram_stack_optimize. */
+
+
+/* Flags that are needed after the current instruction (see the Thumb
+   dead flag elimination pass) */
+#define thumb_flags_live_after()  ((flag_status >> 12) & 0x0F)
+
+/* Fast path for block transfers (LDM/STM, PUSH/POP) that fully hit IWRAM or
+ * EWRAM, which is the common case (stack accesses). It checks that the whole
+ * transfer lies within one 32KB page of IWRAM/EWRAM and, for stores, that no
+ * translated code lives there (SMC tags are zero). If any check fails it
+ * branches to the regular (slow) path, which is emitted right after by the
+ * caller and is left untouched. The slow path must start by restoring the
+ * guest flags (see blkmem_fast_slow_entry) if keep_flags is set.
+ *
+ * Input: reg_s0 holds the (word aligned) start address, regs[] lists the
+ * guest registers in ascending address order. Uses r0, r1, r2 (saved flags),
+ * r9 and lr as temporaries. On success, host flags are restored and loaded
+ * registers written. Returns the number of branches stored in fails[].
+ */
+static u32 emit_blkmem_fast(u8 **tptr, bool store, const u32 *ralloc,
+                            const u8 *regs, u32 n, bool keep_flags,
+                            u8 **fails)
+{
+  u8 *translation_ptr = *tptr;
+  u8 *to_ewram, *to_common;
+  u32 k, nfails = 0;
+
+  if (keep_flags) {
+    ARM_MRS_CPSR(0, reg_a2);
+  }
+
+  /* First and last word must be in the same 32KB page */
+  ARM_MOV_REG_IMMSHIFT(0, reg_a0, reg_s0, ARMSHIFT_LSR, 15);
+  ARM_ADD_REG_IMM(0, reg_a1, reg_s0, (n * 4 - 4), 0);
+  ARM_CMP_REG_IMMSHIFT(0, reg_a0, reg_a1, ARMSHIFT_LSR, 15);
+  fails[nfails++] = translation_ptr;
+  ARM_B_COND(0, ARMCOND_NE, 0);
+
+  ARM_MOV_REG_IMMSHIFT(0, reg_a1, reg_s0, ARMSHIFT_LSR, 24);
+  ARM_CMP_REG_IMM(0, reg_a1, 3, 0);
+  to_ewram = translation_ptr;
+  ARM_B_COND(0, ARMCOND_NE, 0);
+
+  /* IWRAM: data at reg_base + IWRAM_OFF + 0x8000, tags 0x8000 below */
+  ARM_MOV_REG_IMMSHIFT(0, reg_a0, reg_s0, ARMSHIFT_LSL, 17);
+  ARM_SUB_REG_IMM(0, reg_a1, reg_base, 0xA, arm_imm_lsl_to_rot(16));
+  ARM_ADD_REG_IMMSHIFT(0, reg_a0, reg_a1, reg_a0, ARMSHIFT_LSR, 17);
+  if (store) {
+    ARM_SUB_REG_IMM(0, reg_s0, reg_a0, 0x8, arm_imm_lsl_to_rot(12));
+  }
+  to_common = translation_ptr;
+  ARM_B(0, 0);
+
+  /* EWRAM: data at reg_base + EWRAM_OFF, tags 0x40000 above */
+  generate_branch_patch_conditional(to_ewram, translation_ptr);
+  ARM_CMP_REG_IMM(0, reg_a1, 2, 0);
+  fails[nfails++] = translation_ptr;
+  ARM_B_COND(0, ARMCOND_NE, 0);
+  ARM_MOV_REG_IMMSHIFT(0, reg_a0, reg_s0, ARMSHIFT_LSL, 14);
+  ARM_SUB_REG_IMM(0, reg_a1, reg_base, 0x8, arm_imm_lsl_to_rot(16));
+  ARM_ADD_REG_IMMSHIFT(0, reg_a0, reg_a1, reg_a0, ARMSHIFT_LSR, 14);
+  if (store) {
+    ARM_ADD_REG_IMM(0, reg_s0, reg_a0, 0x4, arm_imm_lsl_to_rot(16));
+  }
+  generate_branch_patch_unconditional(to_common, translation_ptr);
+
+  if (store) {
+    /* Any code in the destination? Let the slow path deal with it */
+    ARM_LDR_IMM(0, reg_a1, reg_s0, 0);
+    for (k = 1; k < n; k++) {
+      ARM_LDR_IMM(0, ARMREG_LR, reg_s0, k * 4);
+      ARM_ORR_REG_REG(0, reg_a1, reg_a1, ARMREG_LR);
+    }
+    ARM_CMP_REG_IMM(0, reg_a1, 0, 0);
+    fails[nfails++] = translation_ptr;
+    ARM_B_COND(0, ARMCOND_NE, 0);
+
+    for (k = 0; k < n; k++) {
+      u32 hreg = ralloc[regs[k]];
+      if (hreg != mem_reg) {
+        ARM_STR_IMM(0, hreg, reg_a0, k * 4);
+      } else {
+        ARM_LDR_IMM(0, reg_a1, reg_base, regs[k] * 4);
+        ARM_STR_IMM(0, reg_a1, reg_a0, k * 4);
+      }
+    }
+  } else {
+    for (k = 0; k < n; k++) {
+      u32 hreg = ralloc[regs[k]];
+      if (hreg != mem_reg) {
+        /* Note that PC (if present, it's the last one) maps to reg_a0 */
+        ARM_LDR_IMM(0, hreg, reg_a0, k * 4);
+      } else {
+        ARM_LDR_IMM(0, reg_a1, reg_a0, k * 4);
+        ARM_STR_IMM(0, reg_a1, reg_base, regs[k] * 4);
+      }
+    }
+  }
+
+  if (keep_flags) {
+    ARM_MSR_REG(0, ARM_PSR_F, reg_a2, ARM_CPSR);
+  }
+
+  *tptr = translation_ptr;
+  return nfails;
+}
+
+/* Patches the fast path failure branches to point here and restores flags */
+#define blkmem_fast_slow_entry(fails, nfails, keep_flags)                     \
+{                                                                             \
+  u32 __f;                                                                    \
+  for (__f = 0; __f < nfails; __f++)                                          \
+    generate_branch_patch_conditional(fails[__f], translation_ptr);           \
+  if (keep_flags) {                                                           \
+    ARM_MSR_REG(0, ARM_PSR_F, reg_a2, ARM_CPSR);                              \
+  }                                                                           \
+}                                                                             \
+
+
+/* Inline fast path for single loads/stores that hit IWRAM or EWRAM.
+ * Address is in reg_a0 (and value in reg_a1 for stores). Checks the region
+ * (and alignment, unaligned accesses are left to the handlers since they
+ * have special semantics). Stores check the SMC tags before writing and
+ * bail to the slow path (the regular handler) if there's code there.
+ * Uses reg_a2 (saved flags, if keep_flags), reg_s0 and lr as temporaries.
+ * Loads leave the result in reg_rv (reg_a0). Returns the failure branches
+ * that must be patched to the slow path (see blkmem_fast_slow_entry). */
+#define MEMFAST_8    0
+#define MEMFAST_16   1
+#define MEMFAST_32   2
+#define MEMFAST_SGN  4
+#define memfast_kind_u8    (MEMFAST_8)
+#define memfast_kind_s8    (MEMFAST_8 | MEMFAST_SGN)
+#define memfast_kind_u16   (MEMFAST_16)
+#define memfast_kind_s16   (MEMFAST_16 | MEMFAST_SGN)
+#define memfast_kind_u32   (MEMFAST_32)
+
+static void emit_ram_access(u8 **tptr, u32 kind, bool store, u32 shift,
+                            u32 tag_imm8, u32 tag_rot,
+                            u32 data_imm8, u32 data_rot,
+                            u8 **tagfail)
+{
+  u8 *translation_ptr = *tptr;
+  u32 abits = kind & 3;
+  bool sgn = (kind & MEMFAST_SGN) != 0;
+  /* Word and unsigned byte accesses can use a shifted register offset,
+     halfword and signed byte ones cannot (offset must be shifted down) */
+  bool shifted = (abits == 2) || (abits == 0 && !sgn);
+
+  ARM_MOV_REG_IMMSHIFT(0, ARMREG_LR, reg_a0, ARMSHIFT_LSL, shift);
+  if (!shifted) {
+    ARM_MOV_REG_IMMSHIFT(0, ARMREG_LR, ARMREG_LR, ARMSHIFT_LSR, shift);
+  }
+
+  if (store) {
+    /* Check SMC tags first (same width as the access) */
+    ARM_SUB_REG_IMM(0, reg_s0, reg_base, tag_imm8, tag_rot);
+    if (abits == 2) {
+      ARM_LDR_REG_REG_SHIFT(0, reg_s0, reg_s0, ARMREG_LR, ARMSHIFT_LSR, shift);
+    } else if (abits == 1) {
+      ARM_LDRH_REG_REG(0, reg_s0, reg_s0, ARMREG_LR);
+    } else {
+      ARM_LDRB_REG_REG_SHIFT(0, reg_s0, reg_s0, ARMREG_LR, ARMSHIFT_LSR, shift);
+    }
+    ARM_CMP_REG_IMM(0, reg_s0, 0, 0);
+    *tagfail = translation_ptr;
+    ARM_B_COND(0, ARMCOND_NE, 0);
+    ARM_SUB_REG_IMM(0, reg_s0, reg_base, data_imm8, data_rot);
+    if (abits == 2) {
+      ARM_STR_REG_REG_SHIFT(0, reg_a1, reg_s0, ARMREG_LR, ARMSHIFT_LSR, shift);
+    } else if (abits == 1) {
+      ARM_STRH_REG_REG(0, reg_a1, reg_s0, ARMREG_LR);
+    } else {
+      ARM_STRB_REG_REG_SHIFT(0, reg_a1, reg_s0, ARMREG_LR, ARMSHIFT_LSR, shift);
+    }
+  } else {
+    ARM_SUB_REG_IMM(0, reg_s0, reg_base, data_imm8, data_rot);
+    if (abits == 2) {
+      ARM_LDR_REG_REG_SHIFT(0, reg_rv, reg_s0, ARMREG_LR, ARMSHIFT_LSR, shift);
+    } else if (abits == 1 && sgn) {
+      ARM_LDRSH_REG_REG(0, reg_rv, reg_s0, ARMREG_LR);
+    } else if (abits == 1) {
+      ARM_LDRH_REG_REG(0, reg_rv, reg_s0, ARMREG_LR);
+    } else if (sgn) {
+      ARM_LDRSB_REG_REG(0, reg_rv, reg_s0, ARMREG_LR);
+    } else {
+      ARM_LDRB_REG_REG_SHIFT(0, reg_rv, reg_s0, ARMREG_LR, ARMSHIFT_LSR, shift);
+    }
+  }
+  *tptr = translation_ptr;
+}
+
+/* Emits the regular memory handler call (followed by its PC word) */
+static void emit_mem_handler_call(u8 **tptr, u32 kind, bool store, u32 pcword)
+{
+  u8 *translation_ptr = *tptr;
+  if (store) {
+    switch (kind & 3) {
+    case MEMFAST_8:  generate_store_call_u8();  break;
+    case MEMFAST_16: generate_store_call_u16(); break;
+    default:         generate_store_call_u32(); break;
+    };
+  } else {
+    switch (kind) {
+    case memfast_kind_u8:  generate_load_call_u8();  break;
+    case memfast_kind_s8:  generate_load_call_s8();  break;
+    case memfast_kind_u16: generate_load_call_u16(); break;
+    case memfast_kind_s16: generate_load_call_s16(); break;
+    default:               generate_load_call_u32(); break;
+    };
+  }
+  write32(pcword);
+  *tptr = translation_ptr;
+}
+
+/* Single memory accesses: the IWRAM fast path is emitted inline (taking
+ * about the same space as the regular handler call). Anything else jumps
+ * to a "cold" stub emitted at the end of the block, which handles EWRAM
+ * inline and otherwise calls the regular handler, then jumps back. This
+ * keeps the hot code compact (instruction cache friendly).
+ * Address in reg_a0 (and value in reg_a1 for stores), loads leave the
+ * result in reg_rv. Uses reg_a2 (saved flags if keep_flags), reg_s0 and lr
+ * as temporaries. */
+#ifndef MEMFAST_SINGLE
+#define MEMFAST_SINGLE 1
+#endif
+
+typedef struct {
+  u8 *to_ewram;     /* region != IWRAM branch */
+  u8 *to_slow;      /* IWRAM store with code (SMC) branch, or NULL */
+  u8 *ret;          /* Where to resume */
+  u32 pcword;
+  u8 kind;
+  u8 store;
+  u8 keep_flags;
+} cold_mem_type;
+
+#define MAX_COLD_STUBS      256
+/* Upper bound of the size of a cold stub, in bytes */
+#define COLD_STUB_MAX_SIZE  (32 * 4)
+static cold_mem_type cold_stubs[MAX_COLD_STUBS];
+static u32 cold_stub_count = 0;
+
+static void emit_mem_access(u8 **tptr, u32 kind, bool store, bool keep_flags,
+                            u32 pcword)
+{
+  u8 *translation_ptr = *tptr;
+  u32 abits = kind & 3;
+  cold_mem_type *cs;
+
+  if (!MEMFAST_SINGLE || cold_stub_count >= MAX_COLD_STUBS) {
+    emit_mem_handler_call(tptr, kind, store, pcword);
+    return;
+  }
+
+  cs = &cold_stubs[cold_stub_count++];
+  cs->kind = kind;
+  cs->store = store;
+  cs->keep_flags = keep_flags;
+  cs->pcword = pcword;
+  cs->to_slow = NULL;
+
+  if (keep_flags) {
+    ARM_MRS_CPSR(0, reg_a2);
+  }
+
+  /* Region (and alignment check, misaligned bits end up in the MSBs) */
+  if (abits) {
+    ARM_MOV_REG_IMMSHIFT(0, reg_s0, reg_a0, ARMSHIFT_ROR, abits);
+    ARM_MOV_REG_IMMSHIFT(0, reg_s0, reg_s0, ARMSHIFT_LSR, 24 - abits);
+  } else {
+    ARM_MOV_REG_IMMSHIFT(0, reg_s0, reg_a0, ARMSHIFT_LSR, 24);
+  }
+  ARM_CMP_REG_IMM(0, reg_s0, 3, 0);
+  cs->to_ewram = translation_ptr;
+  ARM_B_COND(0, ARMCOND_NE, 0);
+
+  /* IWRAM: tags at reg_base + IWRAM_OFF, data 0x8000 above */
+  emit_ram_access(&translation_ptr, kind, store, 17,
+                  0xA8, arm_imm_lsl_to_rot(12), 0xA, arm_imm_lsl_to_rot(16),
+                  &cs->to_slow);
+  if (keep_flags) {
+    ARM_MSR_REG(0, ARM_PSR_F, reg_a2, ARM_CPSR);
+  }
+  cs->ret = translation_ptr;
+  *tptr = translation_ptr;
+}
+
+/* Emits the pending cold stubs (at the end of the block) */
+static void emit_cold_stubs(u8 **tptr)
+{
+  u8 *translation_ptr = *tptr;
+  u32 i;
+  for (i = 0; i < cold_stub_count; i++) {
+    cold_mem_type *cs = &cold_stubs[i];
+    u8 *to_slow_region, *to_slow_smc = NULL, *back;
+
+    /* EWRAM: data at reg_base + EWRAM_OFF, tags 0x40000 above */
+    generate_branch_patch_conditional(cs->to_ewram, translation_ptr);
+    ARM_CMP_REG_IMM(0, reg_s0, 2, 0);
+    to_slow_region = translation_ptr;
+    ARM_B_COND(0, ARMCOND_NE, 0);
+    emit_ram_access(&translation_ptr, cs->kind, cs->store, 14,
+                    0x4, arm_imm_lsl_to_rot(16), 0x8, arm_imm_lsl_to_rot(16),
+                    &to_slow_smc);
+    if (cs->keep_flags) {
+      ARM_MSR_REG(0, ARM_PSR_F, reg_a2, ARM_CPSR);
+    }
+    back = translation_ptr;
+    ARM_B(0, 0);
+    generate_branch_patch_unconditional(back, cs->ret);
+
+    /* Slow path: the regular memory handler */
+    generate_branch_patch_conditional(to_slow_region, translation_ptr);
+    if (cs->to_slow) {
+      generate_branch_patch_conditional(cs->to_slow, translation_ptr);
+    }
+    if (to_slow_smc) {
+      generate_branch_patch_conditional(to_slow_smc, translation_ptr);
+    }
+    if (cs->keep_flags) {
+      ARM_MSR_REG(0, ARM_PSR_F, reg_a2, ARM_CPSR);
+    }
+    emit_mem_handler_call(&translation_ptr, cs->kind, cs->store, cs->pcword);
+    back = translation_ptr;
+    ARM_B(0, 0);
+    generate_branch_patch_unconditional(back, cs->ret);
+  }
+  cold_stub_count = 0;
+  *tptr = translation_ptr;
+}
+
+#define generate_block_cold_reset()  cold_stub_count = 0
+#define generate_block_cold_stubs()  emit_cold_stubs(&translation_ptr)
+#define generate_block_cold_size()   (cold_stub_count * COLD_STUB_MAX_SIZE)
 
 #define thumb_block_address_preadjust_down()                                  \
   generate_sub_imm(reg_s0, (bit_count[reg_list] * 4), 0)                      \
@@ -1865,17 +2285,58 @@ static void trace_instruction(u32 pc, u32 mode)
 #define thumb_block_memory_final_pop_pc(access_type)                          \
   thumb_block_memory_##access_type()                                          \
 
+#define thumb_block_extra_reg_no      0
+#define thumb_block_extra_reg_up      0
+#define thumb_block_extra_reg_down    0
+#define thumb_block_extra_reg_push_lr REG_LR
+#define thumb_block_extra_reg_pop_pc  REG_PC
+
+
+#define thumb_block_fast_exit_no()      { fast_done = translation_ptr; ARM_B(0, 0); }
+#define thumb_block_fast_exit_up()      { fast_done = translation_ptr; ARM_B(0, 0); }
+#define thumb_block_fast_exit_down()    { fast_done = translation_ptr; ARM_B(0, 0); }
+#define thumb_block_fast_exit_push_lr() { fast_done = translation_ptr; ARM_B(0, 0); }
+#define thumb_block_fast_exit_pop_pc()                                        \
+{                                                                             \
+  /* PC was loaded into reg_a0, emit the same exit as the slow path */        \
+  u32 __saved_cc = cycle_count;                                               \
+  cycle_count += bit_count[reg_list];                                         \
+  generate_indirect_branch_cycle_update(thumb);                               \
+  cycle_count = __saved_cc;                                                   \
+}                                                                             \
+
 #define thumb_block_memory(access_type, pre_op, post_op, base_reg)            \
 {                                                                             \
   thumb_decode_rlist();                                                       \
   u32 i;                                                                      \
   u32 offset = 0;                                                             \
+  u8 *fast_fails[4];                                                          \
+  u32 fast_nfails = 0;                                                        \
+  u8 *fast_done = NULL;                                                       \
+  u8 fast_regs[9];                                                            \
+  u32 fast_n = 0;                                                             \
+  bool fast_flags = thumb_flags_live_after() != 0;                            \
                                                                               \
   thumb_generate_load_reg(reg_s0, base_reg);                                  \
   ARM_BIC_REG_IMM(0, reg_s0, reg_s0, 0x03, 0);                                \
   thumb_block_address_preadjust_##pre_op();                                   \
   thumb_block_address_postadjust_##post_op(base_reg);                         \
   thumb_generate_store_reg(reg_s0, REG_SAVE);                                 \
+                                                                              \
+  for(i = 0; i < 8; i++)                                                      \
+    if((reg_list >> i) & 0x01)                                                \
+      fast_regs[fast_n++] = i;                                                \
+  if(thumb_block_extra_reg_##post_op)                                         \
+    fast_regs[fast_n++] = thumb_block_extra_reg_##post_op;                    \
+                                                                              \
+  if(fast_n)                                                                  \
+  {                                                                           \
+    fast_nfails = emit_blkmem_fast(&translation_ptr,                          \
+      thumb_block_is_store_##access_type, thumb_register_allocation,          \
+      fast_regs, fast_n, fast_flags, fast_fails);                             \
+    thumb_block_fast_exit_##post_op();                                        \
+    blkmem_fast_slow_entry(fast_fails, fast_nfails, fast_flags);              \
+  }                                                                           \
                                                                               \
   for(i = 0; i < 8; i++)                                                      \
   {                                                                           \
@@ -1898,7 +2359,12 @@ static void trace_instruction(u32 pc, u32 mode)
   }                                                                           \
                                                                               \
   thumb_block_memory_extra_##post_op();                                       \
+  if(fast_done)                                                               \
+    generate_branch_patch_unconditional(fast_done, translation_ptr);          \
 }                                                                             \
+
+#define thumb_block_is_store_store 1
+#define thumb_block_is_store_load  0
 
 #define thumb_conditional_branch(condition)                                   \
 {                                                                             \

@@ -255,15 +255,68 @@ cheat_hook_builder(thumb)
 @ Input:
 @ r0: PC to branch to
 
+@ Indirect branch target cache (IBTC). Maps a guest PC (plus mode) to the
+@ host address of its translated block, so that indirect branches (function
+@ returns, jump tables...) do not need to call the C block lookup functions
+@ every time. Keys: Thumb = pc | 1, ARM = (pc & ~3) | 2. A zero key is never
+@ valid so a cleared table never hits. The table is wiped by the C code
+@ every time any translation cache is flushed (see ibtc_clear).
+@ Uses r1, r2 and lr as temporaries (all dead at an indirect branch), the
+@ key must be in r2 (preserved by call_c_function).
+
+#define ibtc_entry_addr(dst)                                                 ;\
+  eor lr, r2, r2, lsr #12                 /* hash the key                  */;\
+  ldr dst, =ibtc_table                                                       ;\
+  mov lr, lr, lsl #21                                                        ;\
+  mov lr, lr, lsr #22                     /* 10 bit index                  */;\
+  add dst, dst, lr, lsl #3                /* 8 byte entries                */;\
+
+#define ibtc_lookup()                                                        ;\
+  ibtc_entry_addr(r1)                                                        ;\
+  ldr lr, [r1]                            /* cached key                    */;\
+  cmp lr, r2                                                                 ;\
+  bne 98f                                 /* miss, go slow path            */;\
+  ldr r0, [r1, #4]                        /* host block address            */;\
+  restore_flags()                                                            ;\
+  bx r0                                                                      ;\
+98:
+
+#define ibtc_fill()                                                          ;\
+  cmn r0, #1                              /* do not cache bad targets      */;\
+  beq 99f                                                                    ;\
+  ibtc_entry_addr(r1)                                                        ;\
+  str r2, [r1]                                                               ;\
+  str r0, [r1, #4]                                                           ;\
+99:
+
+#define ibtc_key_arm()                                                       ;\
+  bic r2, r0, #3                                                             ;\
+  orr r2, r2, #2                                                             ;\
+
+#define ibtc_key_thumb()                                                     ;\
+  orr r2, r0, #1                                                             ;\
+
+@ These are b stubs for performing indirect branches. They are not
+@ linked to and don't return, instead they link elsewhere.
+
+@ Input:
+@ r0: PC to branch to
+
 defsymbl(arm_indirect_branch_arm)
   save_flags()
+  ibtc_key_arm()
+  ibtc_lookup()
   call_c_function(block_lookup_address_arm)
+  ibtc_fill()
   restore_flags()
   bx r0
 
 defsymbl(arm_indirect_branch_thumb)
   save_flags()
+  ibtc_key_thumb()
+  ibtc_lookup()
   call_c_function(block_lookup_address_thumb)
+  ibtc_fill()
   restore_flags()
   bx r0
 
@@ -272,7 +325,10 @@ defsymbl(arm_indirect_branch_dual_arm)
   tst r0, #0x01                           @ check lower bit
   bne 1f                                  @ if set going to Thumb mode
   add r0, #2                              @ two LSB are cleared after
+  ibtc_key_arm()
+  ibtc_lookup()
   call_c_function(block_lookup_address_arm)
+  ibtc_fill()
   restore_flags()
   bx r0                                   @ keep executing arm code
 1:
@@ -281,7 +337,10 @@ defsymbl(arm_indirect_branch_dual_arm)
   load_registers_thumb()                  @ load in Thumb registers
   orr r1, r1, #0x20                       @ set Thumb mode
   str r1, [reg_base, #REG_CPSR]           @ store flags
+  ibtc_key_thumb()
+  ibtc_lookup()
   call_c_function(block_lookup_address_thumb)
+  ibtc_fill()
   restore_flags()
   bx r0       
 .size arm_indirect_branch_dual_arm, .-arm_indirect_branch_dual_arm
@@ -290,7 +349,10 @@ defsymbl(arm_indirect_branch_dual_thumb)
   save_flags()
   tst r0, #0x01                           @ check lower bit
   beq 1f                                  @ if set going to ARM mode
+  ibtc_key_thumb()
+  ibtc_lookup()
   call_c_function(block_lookup_address_thumb)
+  ibtc_fill()
   restore_flags()
   bx r0                                   @ keep executing thumb code
 1:
@@ -300,10 +362,15 @@ defsymbl(arm_indirect_branch_dual_thumb)
   bic r1, r1, #0x20                       @ clear Thumb mode
   str r1, [reg_base, #REG_CPSR]           @ store flags
   add r0, #2                              @ two LSB are cleared after
+  ibtc_key_arm()
+  ibtc_lookup()
   call_c_function(block_lookup_address_arm)
+  ibtc_fill()
   restore_flags()
   bx r0
 .size arm_indirect_branch_dual_thumb, .-arm_indirect_branch_dual_thumb
+
+.pool
 
 @ Update the cpsr.
 
@@ -507,23 +574,24 @@ return_to_main:
 @ r0: address
 @ r1: value
 @
-@ The instruction at LR is not an inst but a u32 data that contains the PC
-@ Used for SMC. That's why return is essentially `pc = lr + 4`
+@ The instruction at LR is a "b" that skips the u32 data word (at LR + 4) that
+@ contains the PC (used for SMC and I/O). Handlers return with "bx lr" so the
+@ CPU's return stack predicts the return address.
 
 #define execute_store_builder(store_type, str_op, str_op16, load_op)         ;\
                                                                              ;\
 ext_store_u##store_type:                                                     ;\
   save_flags()                                                               ;\
-  ldr r2, [lr]                            /* load PC                       */;\
+  ldr r2, [lr, #4]                        /* load PC                       */;\
   str r2, [reg_base, #REG_PC]             /* write out PC                  */;\
   store_align_##store_type()                                                 ;\
   call_c_function(write_memory##store_type)                                  ;\
   restore_flags()                                                            ;\
-  add pc, lr, #4                          /* return                        */;\
+  bx lr                                   /* return                        */;\
                                                                              ;\
 ext_io_store_u##store_type:                                                  ;\
   save_flags()                                                               ;\
-  ldr r2, [lr]                            /* load PC                       */;\
+  ldr r2, [lr, #4]                        /* load PC                       */;\
   str r2, [reg_base, #REG_PC]             /* write out PC                  */;\
                                                                              ;\
   call_c_function(write_io_register##store_type)                             ;\
@@ -531,7 +599,7 @@ ext_io_store_u##store_type:                                                  ;\
   cmp r0, #0                                                                 ;\
   bne write_epilogue                      /* handle additional write stuff */;\
   restore_flags()                                                            ;\
-  add pc, lr, #4                          /* return                        */;\
+  bx lr                                   /* return                        */;\
                                                                              ;\
 ext_store_iwram_u##store_type:                                               ;\
   save_flags()                                                               ;\
@@ -543,7 +611,7 @@ ext_store_iwram_u##store_type:                                               ;\
   cmp r1, #0                              /* Check value, should be zero   */;\
   bne 3f                                  /* if so perform smc write       */;\
   restore_flags()                                                            ;\
-  add pc, lr, #4                          /* return                        */;\
+  bx lr                                   /* return                        */;\
                                                                              ;\
 ext_store_ewram_u##store_type:                                               ;\
   save_flags()                                                               ;\
@@ -555,7 +623,7 @@ ext_store_ewram_u##store_type:                                               ;\
   cmp r1, #0                              /* Check value, should be zero   */;\
   bne 3f                                  /* if so perform smc write       */;\
   restore_flags()                                                            ;\
-  add pc, lr, #4                          /* return                        */;\
+  bx lr                                   /* return                        */;\
                                                                              ;\
 ext_store_vram_u##store_type:                                                ;\
   save_flags()                                                               ;\
@@ -566,7 +634,7 @@ ext_store_vram_u##store_type:                                                ;\
   add r2, reg_base, #VRAM_OFF             /* r2 = vram base                */;\
   restore_flags()                                                            ;\
   str_op16 r1, [r0, r2]                   /* store data                    */;\
-  add pc, lr, #4                          /* return                        */;\
+  bx lr                                   /* return                        */;\
                                                                              ;\
 ext_store_oam_ram_u##store_type:                                             ;\
   mask_addr_bus16_##store_type(10)        /* Mask to mirror memory (+align)*/;\
@@ -574,17 +642,17 @@ ext_store_oam_ram_u##store_type:                                             ;\
   add r2, reg_base, #OAM_RAM_OFF          /* r2 = oam ram base             */;\
   str_op16 r1, [r0, r2]                   /* store data                    */;\
   str r2, [reg_base, #OAM_UPDATED]        /* write non zero to signal      */;\
-  add pc, lr, #4                          /* return                        */;\
+  bx lr                                   /* return                        */;\
                                                                              ;\
 3: /* Flush RAM cache and "resume" execution via re-compile */               ;\
-  ldr r0, [lr]                            /* load PC                       */;\
+  ldr r0, [lr, #4]                        /* load PC                       */;\
   str r0, [reg_base, #REG_PC]             /* write out PC                  */;\
   call_c_function(flush_translation_cache_ram)                               ;\
   b resume_pc                             /* continue execution            */;\
 
 @ for ignored areas, just return
 ext_store_ignore:
-  add pc, lr, #4                          @ return
+  bx lr                                   @ return
 
 #define store_lookup_table(store_type)                                       ;\
   .word ext_store_ignore                  /*   -1: ignore, for > 0x0F      */;\
@@ -627,10 +695,9 @@ ext_store_palette_u16:
 
   add r1, reg_base, #PAL_CONV_OFF         // r1 = converted palette ram
   strh r2, [r0, r1]                       // Converted value write (r2)
-  add pc, lr, #4                          // return
+  bx lr                                   // return
 
 ext_store_palette_u32_safe:
-  sub lr, lr, #4
 ext_store_palette_u32:
   mask_addr_32(10)                        // Accesses are always 16 bit
   add r2, reg_base, #PAL_RAM_OFF          // r2 = palette base
@@ -654,7 +721,7 @@ ext_store_palette_u32:
   orr r9, r1, lsr #10
   strh r9, [r0, r2]                       // Write second halfword
 
-  add pc, lr, #4                          // return
+  bx lr                                   // return
 
 
 @ This is a store that is executed in a strm case (so no SMC checks in-between)
@@ -810,24 +877,24 @@ lookup_pc:
                                                                              ;\
 ld_bios_##load_type:                      /* BIOS area, need to verify PC  */;\
   save_flags()                                                               ;\
-  ldr r1, [lr]                            /* r1 = PC                       */;\
+  ldr r1, [lr, #4]                        /* r1 = PC                       */;\
   mov r2, r1, lsr #15                     /* r2 = High addr bits from PC   */;\
   cmp r2, #0                                                                 ;\
   bne 10f                                 /* Jump to slow handler          */;\
   ldr r2, [reg_base, #RDMAP_OFF]          /* r2 = read_mem[0]              */;\
   exec_ld_op_##load_type(15)              /* Clear upper bits (15 LSB)     */;\
   restore_flags()                                                            ;\
-  add pc, lr, #4                                                             ;\
+  bx lr                                                                      ;\
                                                                              ;\
 ld_ewram_##load_type:                     /* EWRAM area                    */;\
   add r2, reg_base, #EWRAM_OFF                                               ;\
   exec_ld_op_##load_type(18)              /* Clear upper bits (18 LSB)     */;\
-  add pc, lr, #4                                                             ;\
+  bx lr                                                                      ;\
                                                                              ;\
 ld_iwram_##load_type:                     /* IWRAM area                    */;\
   add r2, reg_base, #(IWRAM_OFF+0x8000)                                      ;\
   exec_ld_op_##load_type(15)              /* Clear upper bits (15 LSB)     */;\
-  add pc, lr, #4                                                             ;\
+  bx lr                                                                      ;\
                                                                              ;\
 ld_ioram_##load_type:                     /* I/O RAM area                  */;\
   save_flags()                            /* cmp trashes the guest flags   */;\
@@ -842,17 +909,17 @@ ld_ioram_##load_type:                     /* I/O RAM area                  */;\
   add r2, reg_base, #IOREG_OFF                                               ;\
   exec_ld_op_##load_type(10)              /* Clear upper bits (10 LSB)     */;\
   restore_flags()                                                            ;\
-  add pc, lr, #4                                                             ;\
+  bx lr                                                                      ;\
                                                                              ;\
 ld_palram_##load_type:                    /* Palette RAM area              */;\
   add r2, reg_base, #PAL_RAM_OFF                                             ;\
   exec_ld_op_##load_type(10)              /* Clear upper bits (10 LSB)     */;\
-  add pc, lr, #4                                                             ;\
+  bx lr                                                                      ;\
                                                                              ;\
 ld_oamram_##load_type:                    /* OAM RAM area                  */;\
   add r2, reg_base, #OAM_RAM_OFF                                             ;\
   exec_ld_op_##load_type(10)              /* Clear upper bits (10 LSB)     */;\
-  add pc, lr, #4                                                             ;\
+  bx lr                                                                      ;\
                                                                              ;\
 /* ROM area: uses generic memory handlers to handle swapping */              ;\
 ld_rdmap_slow_##load_type:                                                   ;\
@@ -865,7 +932,7 @@ ld_rdmap_slow_##load_type:                                                   ;\
                                                                              ;\
   exec_ld_op_##load_type(15)              /* Pages are 32KB big            */;\
   restore_flags()                                                            ;\
-  add pc, lr, #4                                                             ;\
+  bx lr                                                                      ;\
                                                                              ;\
 /* ROM/VRAM area: uses generic memory handlers, assumes is mapped */         ;\
 ld_rdmap_##load_type:                                                        ;\
@@ -874,18 +941,18 @@ ld_rdmap_##load_type:                                                        ;\
   ldr r2, [r2, r1, lsl #2]                /* r2 = base addr                */;\
                                                                              ;\
   exec_ld_op_##load_type(15)              /* Pages are 32KB big            */;\
-  add pc, lr, #4                                                             ;\
+  bx lr                                                                      ;\
                                                                              ;\
 /* Slow load path, for open/unmapped loads                                 */;\
 ld_slow_##load_type:                                                         ;\
   save_flags()                                                               ;\
 9:                                                                           ;\
-  ldr r1, [lr]                            /* r1 = PC                       */;\
+  ldr r1, [lr, #4]                        /* r1 = PC                       */;\
 10:                                                                          ;\
   str r1, [reg_base, #REG_PC]             /* update PC                     */;\
   call_c_function(load_function)                                             ;\
   restore_flags()                                                            ;\
-  add pc, lr, #4                          /* return                        */;\
+  bx lr                                   /* return                        */;\
 
 
 #define load_table_gen(load_type, rdmapfn)                                   ;\

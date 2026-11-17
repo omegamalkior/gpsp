@@ -55,6 +55,8 @@ u8 *ram_translation_ptr = ram_translation_cache;
 #endif
 /* Note, see stub files for more cache definitions */
 
+#define RAM_CACHE_START_OFFSET 16
+
 u32 iwram_code_min = ~0U;
 u32 iwram_code_max =  0U;
 u32 ewram_code_min = ~0U;
@@ -221,6 +223,13 @@ typedef struct
   #include "arm/arm64_emit.h"
 #else
   #include "x86/x86_emit.h"
+#endif
+
+/* Backends can emit out-of-line ("cold") code at the end of each block */
+#ifndef generate_block_cold_reset
+  #define generate_block_cold_reset()
+  #define generate_block_cold_stubs()
+  #define generate_block_cold_size()   0
 #endif
 
 /* Cache invalidation */
@@ -2988,8 +2997,9 @@ u8 function_cc *block_lookup_address_thumb(u32 pc)
   while(--block_data_position >= 0)                                           \
   {                                                                           \
     flag_status = block_data[block_data_position].flag_data;                  \
+    /* Bits 12-15: flags live after this instruction (used by emitters) */   \
     block_data[block_data_position].flag_data =                               \
-     (flag_status & needed_mask);                                             \
+     (flag_status & needed_mask) | ((needed_mask & 0x0F) << 12);              \
     needed_mask &= ~((flag_status >> 4) & 0x0F);                              \
     needed_mask |= flag_status >> 8;                                          \
   }                                                                           \
@@ -3179,6 +3189,7 @@ bool translate_block_arm(u32 pc, bool ram_region)
   }
 
   generate_block_prologue();
+  generate_block_cold_reset();
 
   /* This is a function because it's used a lot more than it might seem (all
      of the data processing functions can access it), and its expansion was
@@ -3231,7 +3242,7 @@ bool translate_block_arm(u32 pc, bool ram_region)
        a simple recursive call here won't work, it has to pedal out to
        the beginning. */
 
-    if(translation_ptr > translation_cache_limit) {
+    if(translation_ptr + generate_block_cold_size() > translation_cache_limit) {
       if (ram_region)
         flush_translation_cache_ram();
       else
@@ -3256,6 +3267,7 @@ bool translate_block_arm(u32 pc, bool ram_region)
   /* Unconditionally generate translation targets. In case we hit one or
      in the unlikely case that block was too big (and not finalized) */
   generate_translation_gate(arm);
+  generate_block_cold_stubs();
 
   for(i = 0; i < block_exit_position; i++)
   {
@@ -3327,6 +3339,7 @@ bool translate_block_thumb(u32 pc, bool ram_region)
   }
 
   generate_block_prologue();
+  generate_block_cold_reset();
 
   /* This is a function because it's used a lot more than it might seem (all
      of the data processing functions can access it), and its expansion was
@@ -3377,7 +3390,7 @@ bool translate_block_thumb(u32 pc, bool ram_region)
        a simple recursive call here won't work, it has to pedal out to
        the beginning. */
 
-    if(translation_ptr > translation_cache_limit)
+    if(translation_ptr + generate_block_cold_size() > translation_cache_limit)
     {
       if (ram_region)
         flush_translation_cache_ram();
@@ -3398,6 +3411,7 @@ bool translate_block_thumb(u32 pc, bool ram_region)
   /* Unconditionally generate translation targets. In case we hit one or
      in the unlikely case that block was too big (and not finalized) */
   generate_translation_gate(thumb);
+  generate_block_cold_stubs();
 
   for(i = 0; i < block_exit_position; i++)
   {
@@ -3435,21 +3449,41 @@ void init_bios_hooks(void)
   // Pre-generate this entry point so that we can safely invoke fast
   // SWI calls from ROM and RAM regardless of cache flushes.
   rom_translation_ptr = &rom_translation_cache[rom_cache_watermark];
-  last_rom_translation_ptr = rom_translation_ptr;
+  /* The emitter may have generated helper code (ie. the SWI div handlers)
+     before the watermark: make sure the next sync covers it as well. */
+  last_rom_translation_ptr = rom_translation_cache;
   bios_swi_entrypoint = block_lookup_address_arm(0x8);
   rom_cache_watermark = (u32)(rom_translation_ptr - rom_translation_cache);
 }
 
+#if defined(ARM_ARCH)
+/* Indirect branch target cache, used by the ARM stubs (see arm_stub.S).
+   Pairs of {key, host address}; a zero key never matches. It must be
+   cleared whenever translated code is discarded. */
+#define IBTC_ENTRIES 1024
+u32 ibtc_table[IBTC_ENTRIES * 2] __attribute__((aligned(64)));
+static void ibtc_clear(void)
+{
+  memset(ibtc_table, 0, sizeof(ibtc_table));
+}
+#else
+static void ibtc_clear(void) {}
+#endif
+
 void flush_translation_cache_ram(void)
 {
+  ibtc_clear();
   /* Flushes RAM caches avoiding doing too much work (ie. wiping unused memory) */
   flush_ram_count++;
   /*printf("ram flush %d (pc %x), %x to %x, %x to %x\n",
    flush_ram_count, reg[REG_PC], iwram_code_min, iwram_code_max,
    ewram_code_min, ewram_code_max);*/
 
-  last_ram_translation_ptr = ram_translation_cache;
-  ram_translation_ptr = ram_translation_cache;
+  /* RAM block offsets are stored in the tag entries, where zero means "not
+     translated yet". Never emit a block at offset zero, otherwise the first
+     block after a flush is translated again on every lookup. */
+  last_ram_translation_ptr = ram_translation_cache + RAM_CACHE_START_OFFSET;
+  ram_translation_ptr = ram_translation_cache + RAM_CACHE_START_OFFSET;
 
   // Proceed to clean the SMC area if needed
   // (also try to memset as little as possible for performance)
@@ -3481,6 +3515,7 @@ void flush_translation_cache_ram(void)
 void flush_translation_cache_rom(void)
 {
   /* We flush the generated code except for everything below the watermark. */
+  ibtc_clear();
   last_rom_translation_ptr = &rom_translation_cache[rom_cache_watermark];
   rom_translation_ptr      = &rom_translation_cache[rom_cache_watermark];
 
@@ -3490,10 +3525,12 @@ void flush_translation_cache_rom(void)
 void init_dynarec_caches(void)
 {
   /* Initialize caches so that we can start initalizing the emitter. */
+  ibtc_clear();
   rom_translation_ptr = last_rom_translation_ptr = &rom_translation_cache[0];
   memset(rom_branch_hash, 0, sizeof(rom_branch_hash));
 
-  ram_translation_ptr = last_ram_translation_ptr = &ram_translation_cache[0];
+  ram_translation_ptr = last_ram_translation_ptr =
+    &ram_translation_cache[RAM_CACHE_START_OFFSET];
   memset(iwram, 0, 0x8000);
   memset(&ewram[0x40000], 0, 0x40000);
 
