@@ -685,12 +685,14 @@ int main(int argc, char **argv) {
   u32 sp = 0xbf000000;
   u32 strs[64]; int nargs = argc - ai;
   for (int i = 0; i < nargs; i++) { size_t l = strlen(argv[ai + i]) + 1; sp -= l; memcpy(G(sp), argv[ai + i], l); strs[i] = sp; }
-  const char *envs[] = { "HOME=/tmp", NULL, NULL, NULL, NULL, NULL }; int nenv = 1;
+  const char *envs[10] = { "HOME=/tmp" }; int nenv = 1;
   if (getenv("NOHASH")) envs[nenv++] = "NOHASH=1";
   if (getenv("FRAMESKIP")) { static char b[64]; snprintf(b, 64, "FRAMESKIP=%s", getenv("FRAMESKIP")); envs[nenv++] = b; }
   if (getenv("DUMP_PPM")) { static char b[512]; snprintf(b, 512, "DUMP_PPM=%s", getenv("DUMP_PPM")); envs[nenv++] = b; }
   if (getenv("GPSP_DRC_DUMP")) { static char b[512]; snprintf(b, 512, "GPSP_DRC_DUMP=%s", getenv("GPSP_DRC_DUMP")); envs[nenv++] = b; }
-  u32 envp[6];
+  static const char *pass[] = { "REWIND", "REWIND_LEN" };
+  for (int i = 0; i < 2; i++) if (getenv(pass[i])) { static char b[2][64]; snprintf(b[i], 64, "%s=%s", pass[i], getenv(pass[i])); envs[nenv++] = b[i]; }
+  u32 envp[10];
   for (int i = 0; i < nenv; i++) { size_t l = strlen(envs[i]) + 1; sp -= l; memcpy(G(sp), envs[i], l); envp[i] = sp; }
   sp -= 16; u32 rnd = sp; for (int i = 0; i < 16; i++) *G(rnd + i) = i * 7;
   sp &= ~15u;

@@ -77,6 +77,7 @@ void retro_set_audio_sample(retro_audio_sample_t); void retro_set_audio_sample_b
 void retro_set_input_poll(retro_input_poll_t); void retro_set_input_state(retro_input_state_t);
 void retro_init(void); bool retro_load_game(const struct retro_game_info *); void retro_run(void);
 void retro_unload_game(void); void retro_deinit(void);
+size_t retro_serialize_size(void); bool retro_serialize(void *, size_t); bool retro_unserialize(const void *, size_t);
 int main(int argc, char **argv) {
   /* usage: run rom frames [drc] [hashfile] */
   if (argc < 3) { fprintf(stderr, "usage\n"); return 1; }
@@ -94,10 +95,33 @@ int main(int argc, char **argv) {
   struct retro_game_info gi = { argv[1], buf, sz, NULL };
   if (!retro_load_game(&gi)) { fprintf(stderr, "load failed\n"); return 1; }
   unsigned frames = atoi(argv[2]);
+  /* REWIND=N: every N frames save a state, run REWIND_LEN frames (default
+     120) recording each frame's hash, load the state back and replay them.
+     The replay must produce the same frames (tests state loading, which
+     flushes the dynarec caches). */
+  unsigned rw = getenv("REWIND") ? atoi(getenv("REWIND")) : 0;
+  unsigned rwlen = getenv("REWIND_LEN") ? atoi(getenv("REWIND_LEN")) : 120;
+  unsigned rw_count = 0, rw_fail = 0;
   for (frame_no = 0; frame_no < frames; frame_no++) {
+    if (rw && frame_no && (frame_no % rw) == 0 && frame_no + rwlen < frames) {
+      size_t ssz = retro_serialize_size();
+      void *st = malloc(ssz);
+      uint64_t *rec = malloc(rwlen * sizeof(uint64_t));
+      unsigned f0 = frame_no, k;
+      retro_serialize(st, ssz);
+      for (k = 0; k < rwlen; k++, frame_no++) { retro_run(); rec[k] = frame_vhash; }
+      retro_unserialize(st, ssz);
+      frame_no = f0;
+      for (k = 0; k < rwlen; k++, frame_no++) { retro_run(); if (rec[k] != frame_vhash) { rw_fail++; break; } }
+      frame_no = f0;
+      retro_unserialize(st, ssz);
+      rw_count++;
+      free(st); free(rec);
+    }
     retro_run();
     if (hf) fprintf(hf, "%u %016llx\n", frame_no, (unsigned long long)frame_vhash);
   }
+  if (rw) fprintf(stderr, "rewinds=%u rewind_failures=%u\n", rw_count, rw_fail);
   printf("frames=%u video=%016llx audio=%016llx asamples=%u\n", frames,
          (unsigned long long)vhash, (unsigned long long)ahash, audio_frames);
   if (getenv("DUMP_PPM")) { FILE *p = fopen(getenv("DUMP_PPM"), "wb"); fprintf(p, "P6 240 160 255\n");

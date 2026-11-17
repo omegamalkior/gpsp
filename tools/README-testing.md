@@ -106,3 +106,23 @@ most sensitive). With Luma3DS:
   with the same compiler and flags.
 * RetroArch's own frame time counter (Settings > On-Screen Display) is a
   quick check but includes video output and vsync.
+
+### Ready-made timing builds
+
+The `gpsp-split-3ds-timing` branch of omegamalkior/RetroArch builds one
+RetroArch 3DS per gpSP version (the original and each split branch) with
+`GPSP_HW_TIMING=1`. Each build:
+
+* boots `sdmc:/roms/gba/metroid_fusion.gba` (put your own dump there),
+* plays it with the same scripted input as `tools/armtest/harness`,
+* times `retro_run()` with `svcGetSystemTick()`, leaving out the video and
+  audio callbacks, and after 6000 frames writes the averages to
+  `sdmc:/retroarch/e2e/out_<name>/log.txt`, with whether the dynarec and
+  svchax were active,
+* saves frames 300, 900, 1500, 2100 and 2399 next to the log.
+
+Run each build once (about two minutes each; "DONE" appears in the log when
+it is finished), copy `sdmc:/retroarch/e2e` to a PC and run
+`tools/3ds/compare_timing.py <that folder>`. It prints the core time per
+frame against the original, and whether the saved frames are identical to
+the original's (they must be).
