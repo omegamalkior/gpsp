@@ -3138,6 +3138,44 @@ if (ram_region) {                                                             \
 #define translate_vram_entry(type)
 #endif
 
+/* Debug aid (build with -DGPSP_DRC_DUMP): writes every translated block to a
+   file so the generated host code can be disassembled and compared between
+   builds (see tools/drc/drc_dump.py). The file name comes from the
+   GPSP_DRC_DUMP environment variable (default: gpsp_drc_dump.bin).
+   Record: u32 magic 'DRCB', u32 guest_pc (bit 0 set = Thumb),
+   u32 guest_end_pc, u32 host_addr_lo, u32 host_addr_hi, u32 size, code[size].
+   Blocks are dumped before their exits are linked to other blocks. */
+#ifdef GPSP_DRC_DUMP
+#include <stdlib.h>
+static void drc_dump_block(u32 pc, u32 end_pc, bool thumb,
+                           const u8 *start, const u8 *end)
+{
+  static FILE *f = NULL;
+  u32 hdr[6];
+  if (!f) {
+    const char *path = getenv("GPSP_DRC_DUMP");
+    f = fopen(path ? path : "gpsp_drc_dump.bin", "wb");
+    if (!f)
+      return;
+  }
+  hdr[0] = 0x42435244;
+  hdr[1] = pc | (thumb ? 1 : 0);
+  hdr[2] = end_pc;
+  hdr[3] = (u32)(uintptr_t)start;
+  hdr[4] = (u32)((u64)(uintptr_t)start >> 32);
+  hdr[5] = (u32)(end - start);
+  fwrite(hdr, sizeof(hdr), 1, f);
+  fwrite(start, 1, end - start, f);
+  fflush(f);
+}
+#define drc_dump_start(ptr)  u8 *drc_dump_from = (ptr)
+#define drc_dump_end(pc, end_pc, thumb, ptr) \
+  drc_dump_block(pc, end_pc, thumb, drc_dump_from, ptr)
+#else
+#define drc_dump_start(ptr)
+#define drc_dump_end(pc, end_pc, thumb, ptr)
+#endif
+
 bool translate_block_arm(u32 pc, bool ram_region)
 {
   u32 opcode = 0;
@@ -3178,6 +3216,7 @@ bool translate_block_arm(u32 pc, bool ram_region)
      TRANSLATION_CACHE_LIMIT_THRESHOLD;
   }
 
+  drc_dump_start(translation_ptr);
   generate_block_prologue();
 
   /* This is a function because it's used a lot more than it might seem (all
@@ -3280,6 +3319,8 @@ bool translate_block_arm(u32 pc, bool ram_region)
     }
   }
 
+  drc_dump_end(block_start_pc, block_end_pc, false, translation_ptr);
+
   if (ram_region)
     ram_translation_ptr = translation_ptr;
   else
@@ -3326,6 +3367,7 @@ bool translate_block_thumb(u32 pc, bool ram_region)
        ROM_TRANSLATION_CACHE_SIZE - TRANSLATION_CACHE_LIMIT_THRESHOLD];
   }
 
+  drc_dump_start(translation_ptr);
   generate_block_prologue();
 
   /* This is a function because it's used a lot more than it might seem (all
@@ -3421,6 +3463,8 @@ bool translate_block_thumb(u32 pc, bool ram_region)
         return false;
     }
   }
+
+  drc_dump_end(block_start_pc, block_end_pc, true, translation_ptr);
 
   if (ram_region)
     ram_translation_ptr = translation_ptr;
