@@ -2,6 +2,19 @@ gpSP ARM speedups v2.0 - benchmarks
 Estimated ARM11 (3DS CPU) cycles per frame, armemu simulator, ARMv6K build. Not real-3DS timing.
 Each line: original gpSP -> with that change only.
 
+Test key (all free GBA homebrew or test ROMs, except Metroid Fusion):
+  fusion-intro  Metroid Fusion (Nintendo), opening sequence
+  fusion-play   Metroid Fusion (Nintendo), recorded gameplay
+  arkanoid      @rkanoid, brick-breaker (github.com/benoror/gbadev)
+  cebelix       Cebelix, platformer demo (github.com/benoror/gbadev)
+  dezgex        DexGex, top-down RPG demo (github.com/benoror/gbadev)
+  mysticq       Mystic Quest, older build of DexGex (github.com/benoror/gbadev)
+  ld46          Ludum Dare 46 game jam entry (github.com/timostrating/Ludumdare46)
+  maze          Maze game (github.com/itzAbum/Maze)
+  ravenx        Raven X, side-scrolling shooter (github.com/idolize/ravenx-gba)
+  bench         synthetic CPU-heavy test ROM written for this work
+
+
 == pr/fix-bios-div-cache-sync
 arkanoid      insns  1102383 ->  1102383 (+0.00%)  cycles  1598810 ->  1598811 (+0.00%)
 bench         insns  2087224 ->  2087224 (+0.00%)  cycles  3020405 ->  3020405 (+0.00%)
