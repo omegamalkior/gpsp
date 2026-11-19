@@ -86,8 +86,10 @@ calls into shared handlers, so compare the whole-emulator total, not only the
 
 Good test ROMs: jsmolka's gba-tests (arm, thumb, memory, bios), FuzzARM,
 armwrestler, alyosha-tas's gba-tests, `gbabench/torture.c` (self-modifying
-code, unaligned and mirrored accesses, stack-heavy code) and real games with
-recorded input.
+code, unaligned and mirrored accesses, stack-heavy code),
+`gbabench/torture_m.c` (loads of every width and LDM/STM block transfers
+on every memory region, from Thumb and ARM code in ROM and ARM code in
+IWRAM) and real games with recorded input.
 
 ## 3. Speed: a real 3DS
 
