@@ -1,0 +1,2 @@
+gpSP a70c925984835c79ead9d79b6f16307cfcbd4b28 Merge pr/arm-mem-fastpath-block
+RetroArch 8a386424a67b42fb9066f32003805dc0097edaa2 ctr_dsp: a blocking write waits on the DSP's frame event
