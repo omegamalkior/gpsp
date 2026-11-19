@@ -1,0 +1,54 @@
+name: 3DS release build
+
+# Builds RetroArch 3DS (current libretro/RetroArch master) with this fork's
+# gpSP core, the same way the libretro buildbot packages the official gpSP
+# core (LIBRETRO=gpsp: same title, icon and title ID). Nothing in RetroArch
+# is changed. The files are pushed to the release-assets branch.
+
+on:
+  push:
+    branches: [release-build]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: |
+        GPSP_REF=$(cat gpsp-ref.txt)
+        cat > build.sh <<'SCRIPT'
+        set -e
+        git config --global --add safe.directory '*'
+        git clone https://github.com/omegamalkior/gpsp.git /tmp/gpsp
+        cd /tmp/gpsp
+        git checkout "$GPSP_REF"
+        git log -1 --format='gpSP %H %s' > /w/out/build-info.txt
+        make platform=ctr -j$(getconf _NPROCESSORS_ONLN)
+        git clone --depth 1 https://github.com/libretro/RetroArch.git /tmp/ra
+        cd /tmp/ra
+        git log -1 --format='RetroArch %H %s' >> /w/out/build-info.txt
+        cp /tmp/gpsp/gpsp_libretro_ctr.a libretro_ctr.a
+        make -f Makefile.ctr -j$(getconf _NPROCESSORS_ONLN) LIBRETRO=gpsp
+        cp retroarch_3ds.cia /w/out/gpsp_libretro.cia
+        cp retroarch_3ds.3dsx /w/out/gpsp_libretro.3dsx
+        cp retroarch_3ds.smdh /w/out/gpsp_libretro.smdh 2>/dev/null || true
+        SCRIPT
+        mkdir -p out
+        docker run --rm --user root -v "$PWD:/w" -w /w -e GPSP_REF="$GPSP_REF" \
+          reallibretroretroarch/libretro-build-devkitpro:latest bash /w/build.sh
+        cd out && sha256sum * > SHA256SUMS.txt && ls -la && cat build-info.txt
+    - name: Push to the release-assets branch
+      run: |
+        cd out
+        git init -q
+        git config user.name "gpsp 3ds build"
+        git config user.email "noreply@github.com"
+        git checkout -q --orphan release-assets
+        git add -A
+        git commit -q -m "3DS build of $(cat ../gpsp-ref.txt) (${GITHUB_SHA})"
+        git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" release-assets
